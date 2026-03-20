@@ -1,0 +1,32 @@
+--------------------------------------------------------------------------------
+CPU name:	Intel(R) Xeon(R) Platinum 8380 CPU @ 2.30GHz
+CPU type:	Intel Icelake SP processor
+CPU clock:	2.29 GHz
+--------------------------------------------------------------------------------
+Group 1: FLOPS_DP
++------------------------------------------+---------+------------+
+|                   Event                  | Counter | HWThread 0 |
++------------------------------------------+---------+------------+
+|             INSTR_RETIRED_ANY            |  FIXC0  |     924008 |
+|           CPU_CLK_UNHALTED_CORE          |  FIXC1  |     912320 |
+|           CPU_CLK_UNHALTED_REF           |  FIXC2  |     911260 |
+|               TOPDOWN_SLOTS              |  FIXC3  |    4561600 |
+| FP_ARITH_INST_RETIRED_128B_PACKED_DOUBLE |   PMC0  |          0 |
+|    FP_ARITH_INST_RETIRED_SCALAR_DOUBLE   |   PMC1  |          1 |
+| FP_ARITH_INST_RETIRED_256B_PACKED_DOUBLE |   PMC2  |          0 |
+| FP_ARITH_INST_RETIRED_512B_PACKED_DOUBLE |   PMC3  |          0 |
++------------------------------------------+---------+------------+
++-------------------------+------------+
+|          Metric         | HWThread 0 |
++-------------------------+------------+
+|   Runtime (RDTSC) [s]   |     0.0019 |
+|   Runtime unhalted [s]  |     0.0004 |
+|       Clock [MHz]       |  2297.2502 |
+|           CPI           |     0.9874 |
+|       DP [MFLOP/s]      |     0.0005 |
+|     AVX DP [MFLOP/s]    |          0 |
+|   AVX512 DP [MFLOP/s]   |          0 |
+|     Packed [MUOPS/s]    |          0 |
+|     Scalar [MUOPS/s]    |     0.0005 |
+| Vectorization ratio [%] |          0 |
++-------------------------+------------+
