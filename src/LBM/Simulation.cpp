@@ -6,13 +6,91 @@
 #include <vector>
 #include <map>
 #include <cstdlib>      // free()
-#include <unistd.h>     // usleep
 
 #include "../LBM/parallel.h"
 #include <omp.h>
 
 
 namespace LBM {
+
+namespace {
+
+struct OutboundMsg {
+    int dest;
+    size_t tag[2];
+    double *value;
+};
+
+// Same send-set used at init (for recv counts) and every communicate() step.
+std::vector<OutboundMsg> buildOutbound(Domain *domain)
+{
+    auto& messengers = domain->messengers;
+    size_t nDirections = domain->set->nDirections;
+    size_t nDimensions = domain->set->nDimensions;
+    size_t nNodes = domain->distribution_values.size() / nDirections;
+
+    std::vector<OutboundMsg> outbound;
+    outbound.reserve(messengers.size());
+
+    for (size_t msg_idx = 0; msg_idx < messengers.size(); ++msg_idx)
+    {
+        auto& messenger = messengers[msg_idx];
+        size_t node_idx = messenger.d_tag[0];
+        size_t dir = messenger.d_tag[1];
+        int dest = static_cast<int>(messenger.d_p);
+
+        if (node_idx == SIZE_MAX || node_idx >= nNodes)
+        {
+            auto it = domain->messenger_to_sender.find(msg_idx);
+            if (it == domain->messenger_to_sender.end())
+                continue;
+
+            size_t sender_node_idx = it->second.first;
+            size_t sender_dir = it->second.second;
+            if (sender_node_idx >= nNodes || sender_dir >= nDirections)
+                continue;
+
+            size_t pos_offset = sender_node_idx * nDimensions;
+            if (pos_offset + nDimensions > domain->position.size())
+                continue;
+
+            std::vector<int> sender_position;
+            sender_position.reserve(nDimensions);
+            for (size_t dim = 0; dim < nDimensions; ++dim)
+                sender_position.push_back(static_cast<int>(domain->position[pos_offset + dim]));
+
+            auto dir_vec = domain->set->direction(sender_dir);
+            std::vector<int> receiver_position;
+            receiver_position.reserve(sender_position.size());
+            for (size_t dim = 0; dim < sender_position.size(); ++dim)
+            {
+                int domain_size_dim = static_cast<int>(domain->domain_size[dim]);
+                int coord = (sender_position[dim] + dir_vec[dim] + domain_size_dim) % domain_size_dim;
+                receiver_position.push_back(coord);
+            }
+
+            size_t receiver_hash = receiver_position[0];
+            size_t multiplier = domain->domain_size[0];
+            for (size_t dim = 1; dim < receiver_position.size(); ++dim)
+            {
+                receiver_hash += receiver_position[dim] * multiplier;
+                multiplier *= domain->domain_size[dim];
+            }
+
+            outbound.push_back(OutboundMsg{dest, {receiver_hash, dir}, &messenger.d_src});
+            continue;
+        }
+
+        if (dir >= nDirections)
+            continue;
+
+        outbound.push_back(OutboundMsg{dest, {node_idx, dir}, &messenger.d_src});
+    }
+
+    return outbound;
+}
+
+} // namespace
 
     Simulation::Simulation(Initializer_Ptr initializer)
     :
@@ -23,13 +101,32 @@ namespace LBM {
         d_poststream_time(0.0),
         d_step_count(0)
     {
-        // Synchronize all processes before starting simulation
+        cacheHaloRecvCounts();
         MPI_Barrier(d_domain->comm);
     }
 
     Simulation::~Simulation()
     {
         // cleanup handled by vectors
+    }
+
+    void Simulation::cacheHaloRecvCounts()
+    {
+        int size;
+        MPI_Comm comm = d_domain->comm;
+        MPI_Comm_size(comm, &size);
+
+        auto outbound = buildOutbound(d_domain.get());
+        std::vector<int> send_counts(static_cast<size_t>(size), 0);
+        for (const auto &msg : outbound)
+        {
+            if (msg.dest >= 0 && msg.dest < size)
+                send_counts[static_cast<size_t>(msg.dest)]++;
+        }
+
+        d_domain->halo_recv_counts.assign(static_cast<size_t>(size), 0);
+        MPI_Alltoall(send_counts.data(), 1, MPI_INT,
+                     d_domain->halo_recv_counts.data(), 1, MPI_INT, comm);
     }
 
     void Simulation::step()
@@ -127,220 +224,71 @@ namespace LBM {
 
     void Simulation::communicate()
     {
-        int rank, size;
+        int size;
         MPI_Comm comm = d_domain->comm;
-        MPI_Comm_rank(comm, &rank);
         MPI_Comm_size(comm, &size);
 
-        std::vector<MPI_Request> send_requests;
-        // Use d_domain->messengers directly
-        auto& messengers = d_domain->messengers;
-        send_requests.reserve(messengers.size() * 2);
-        
         size_t nNodes = d_domain->distribution_values.size() / d_domain->set->nDirections;
-        size_t nDimensions = d_domain->set->nDimensions;
-
-        size_t skipped_sends = 0;
-        size_t inferred_sends = 0;
-        size_t total_sends = 0;
-        
-        for (size_t msg_idx = 0; msg_idx < messengers.size(); ++msg_idx)
-        {
-            auto& messenger = messengers[msg_idx];
-            size_t node_idx = messenger.d_tag[0];
-            size_t dir = messenger.d_tag[1];
-            
-            if (node_idx == SIZE_MAX || node_idx >= nNodes)
-            {
-                if (d_domain->messenger_to_sender.find(msg_idx) != d_domain->messenger_to_sender.end())
-                {
-                    auto sender_info = d_domain->messenger_to_sender[msg_idx];
-                    size_t sender_node_idx = sender_info.first;
-                    size_t sender_dir = sender_info.second;
-                    
-                    if (sender_node_idx < nNodes && 
-                        sender_dir < d_domain->set->nDirections)
-                    {
-                        std::vector<int> sender_position;
-                        size_t pos_offset = sender_node_idx * nDimensions;
-                        // Use flat position vector
-                        // Note: nDimensions check? position vector size is nNodes * nDimensions?
-                        // Assuming position vector is populated.
-                        if (pos_offset + nDimensions <= d_domain->position.size()) {
-                            for (size_t dim = 0; dim < nDimensions; ++dim)
-                                sender_position.push_back(static_cast<int>(d_domain->position[pos_offset + dim]));
-                        }
-                        
-                        std::vector<int> receiver_position;
-                        auto dir_vec = d_domain->set->direction(sender_dir);
-                        
-                        if (sender_position.size() <= d_domain->domain_size.size())
-                        {
-                            for (size_t dim = 0; dim < sender_position.size(); ++dim)
-                            {
-                                int domain_size_dim = static_cast<int>(d_domain->domain_size[dim]);
-                                int coord = (sender_position[dim] + dir_vec[dim] + domain_size_dim) % domain_size_dim;
-                                receiver_position.push_back(coord);
-                            }
-                            
-                            size_t receiver_hash = receiver_position[0];
-                            size_t multiplier = d_domain->domain_size[0];
-                            for (size_t dim = 1; dim < receiver_position.size(); ++dim)
-                            {
-                                receiver_hash += receiver_position[dim] * multiplier;
-                                multiplier *= d_domain->domain_size[dim];
-                            }
-                            
-                            size_t tag_data[2] = {receiver_hash, dir};
-                            MPI_Request req;
-                            MPI_Isend(tag_data, 2, MPI_UNSIGNED_LONG, 
-                                     static_cast<int>(messenger.d_p), 0, comm, &req);
-                            send_requests.push_back(req);
-                            
-                            MPI_Isend(&messenger.d_src, 1, MPI_DOUBLE, 
-                                     static_cast<int>(messenger.d_p), 1, comm, &req);
-                            send_requests.push_back(req);
-                            inferred_sends++;
-                            continue;
-                        }
-                    }
-                }
-                
-                skipped_sends++;
-                continue;
-            }
-            
-            if (dir >= d_domain->set->nDirections) {
-                skipped_sends++;
-                continue;
-            }
-            
-            MPI_Request req;
-            size_t tag_data[2] = {node_idx, dir};
-            
-            MPI_Isend(tag_data, 2, MPI_UNSIGNED_LONG, 
-                     static_cast<int>(messenger.d_p), 0, comm, &req);
-            send_requests.push_back(req);
-            
-            MPI_Isend(&messenger.d_src, 1, MPI_DOUBLE, 
-                     static_cast<int>(messenger.d_p), 1, comm, &req);
-            send_requests.push_back(req);
-            total_sends++;
-        }
-        
-        if (!send_requests.empty())
-        {
-            std::vector<MPI_Status> send_statuses(send_requests.size());
-            MPI_Waitall(static_cast<int>(send_requests.size()), send_requests.data(), send_statuses.data());
-        }
-        
-        MPI_Barrier(comm);
-        
-        std::vector<size_t> recv_tags_node;
-        std::vector<size_t> recv_tags_dir;
-        std::vector<double> recv_values;
-        
-        int received_pairs = 0;
-        int probe_count = 0;
-        int consecutive_empty_probes = 0;
-        const int MAX_EMPTY_PROBES = 100;
-        
-         while (consecutive_empty_probes < MAX_EMPTY_PROBES)
-         {
-             MPI_Status probe_status;
-             int flag = 0;
-             MPI_Iprobe(MPI_ANY_SOURCE, 0, comm, &flag, &probe_status);
-             probe_count++;
-             
-             if (flag)
-             {
-                 consecutive_empty_probes = 0;
-                 int source = probe_status.MPI_SOURCE;
-                 
-                 size_t tag_data[2];
-                 MPI_Recv(tag_data, 2, MPI_UNSIGNED_LONG, source, 0, comm, MPI_STATUS_IGNORE);
-                 
-                 MPI_Status value_probe_status;
-                 int value_flag = 0;
-                 MPI_Iprobe(source, 1, comm, &value_flag, &value_probe_status);
-                 
-                 if (!value_flag) {
-                     continue;
-                 }
-                 
-                 double value;
-                 MPI_Recv(&value, 1, MPI_DOUBLE, source, 1, comm, MPI_STATUS_IGNORE);
-                 
-                 recv_tags_node.push_back(tag_data[0]);
-                 recv_tags_dir.push_back(tag_data[1]);
-                 recv_values.push_back(value);
-                 
-                 received_pairs++;
-             }
-             else
-             {
-                 consecutive_empty_probes++;
-                 if (consecutive_empty_probes < 5) {
-                 } else if (consecutive_empty_probes < 20) {
-                     usleep(50);
-                 } else {
-                     usleep(200);
-                 }
-             }
-         }
-        
-        MPI_Status final_probe_status;
-        int final_flag = 0;
-        MPI_Iprobe(MPI_ANY_SOURCE, 0, comm, &final_flag, &final_probe_status);
-        
-        int additional_received = 0;
-        while (final_flag && additional_received < 1000)
-        {
-            int source = final_probe_status.MPI_SOURCE;
-            size_t tag_data[2];
-            MPI_Recv(tag_data, 2, MPI_UNSIGNED_LONG, source, 0, comm, MPI_STATUS_IGNORE);
-            double value;
-            MPI_Recv(&value, 1, MPI_DOUBLE, source, 1, comm, MPI_STATUS_IGNORE);
-            recv_tags_node.push_back(tag_data[0]);
-            recv_tags_dir.push_back(tag_data[1]);
-            recv_values.push_back(value);
-            received_pairs++;
-            additional_received++;
-            MPI_Iprobe(MPI_ANY_SOURCE, 0, comm, &final_flag, &final_probe_status);
-        }
-
         size_t nDirections = d_domain->set->nDirections;
-        size_t valid_updates = 0;
-        size_t invalid_updates = 0;
-        size_t hash_conversions = 0;
-        
-        for (size_t i = 0; i < recv_tags_node.size(); ++i)
+
+        auto outbound = buildOutbound(d_domain.get());
+        const auto &recv_counts = d_domain->halo_recv_counts;
+
+        int n_recv = 0;
+        for (int c : recv_counts)
+            n_recv += c;
+
+        std::vector<size_t> recv_tags(static_cast<size_t>(n_recv) * 2);
+        std::vector<double> recv_values(static_cast<size_t>(n_recv));
+        std::vector<MPI_Request> requests;
+        requests.reserve(static_cast<size_t>(n_recv) * 2 + outbound.size() * 2);
+
+        // Post all Irecvs first (deadlock-free with subsequent Isends).
+        size_t recv_slot = 0;
+        for (int src = 0; src < size; ++src)
         {
-            size_t node_idx = recv_tags_node[i];
-            size_t dir = recv_tags_dir[i];
-            
+            int count = (static_cast<size_t>(src) < recv_counts.size())
+                            ? recv_counts[static_cast<size_t>(src)] : 0;
+            for (int i = 0; i < count; ++i)
+            {
+                MPI_Request req_tag, req_val;
+                MPI_Irecv(recv_tags.data() + recv_slot * 2, 2, MPI_UNSIGNED_LONG,
+                         src, 0, comm, &req_tag);
+                MPI_Irecv(recv_values.data() + recv_slot, 1, MPI_DOUBLE,
+                         src, 1, comm, &req_val);
+                requests.push_back(req_tag);
+                requests.push_back(req_val);
+                recv_slot++;
+            }
+        }
+
+        for (auto &msg : outbound)
+        {
+            MPI_Request req_tag, req_val;
+            MPI_Isend(msg.tag, 2, MPI_UNSIGNED_LONG, msg.dest, 0, comm, &req_tag);
+            MPI_Isend(msg.value, 1, MPI_DOUBLE, msg.dest, 1, comm, &req_val);
+            requests.push_back(req_tag);
+            requests.push_back(req_val);
+        }
+
+        if (!requests.empty())
+            MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+
+        for (int i = 0; i < n_recv; ++i)
+        {
+            size_t node_idx = recv_tags[static_cast<size_t>(i) * 2];
+            size_t dir = recv_tags[static_cast<size_t>(i) * 2 + 1];
+
             if (node_idx >= nNodes && !d_domain->map_to_index.empty())
             {
-                if (d_domain->map_to_index.find(node_idx) != d_domain->map_to_index.end())
-                {
-                    node_idx = d_domain->map_to_index[node_idx];
-                    hash_conversions++;
-                }
+                auto it = d_domain->map_to_index.find(node_idx);
+                if (it != d_domain->map_to_index.end())
+                    node_idx = it->second;
             }
-            
+
             if (node_idx < nNodes && dir < nDirections)
-            {
-                // SoA update
-                d_domain->distribution_nextValues[node_idx * nDirections + dir] = recv_values[i];
-                valid_updates++;
-            }
-            else
-            {
-                invalid_updates++;
-            }
+                d_domain->distribution_nextValues[node_idx * nDirections + dir] = recv_values[static_cast<size_t>(i)];
         }
-        
-        MPI_Barrier(comm);
     }
 
     void Simulation::report()

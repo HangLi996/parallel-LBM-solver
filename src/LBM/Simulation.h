@@ -53,6 +53,7 @@ namespace LBM {
             void postStreamProcess();
             void collission();
             void communicate();
+            void cacheHaloRecvCounts();
 
     };
 }

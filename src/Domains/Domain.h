@@ -41,6 +41,9 @@ struct Domain {
     
     // MPI communicator (Cartesian topology if available, otherwise MPI_COMM_WORLD)
     MPI_Comm comm;
+
+    // Halo exchange: per-source recv counts, filled once at init via Alltoall
+    std::vector<int> halo_recv_counts;
 };
 
 #endif
